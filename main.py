@@ -1,4 +1,5 @@
 import json
+import hashlib
 import os
 import re
 import sys
@@ -126,30 +127,35 @@ def analyze(view):
     living_claimants = set(claimants)
     trusted = set()
     conflicting_claimants = set()
+    claimant_scores = {}
+    claimant_first = {}
     for claimant, results in claimants.items():
-        conflict = False
+        score = 0
         seen = {}
+        first_day = min((s["day"] for s in speeches if s["seat"] == claimant), default=99)
+        claimant_first[claimant] = first_day
+        score += 2 if first_day == 1 else (1 if first_day == 2 else 0)
         for target, is_wolf in results:
             if target in seen and seen[target] != is_wolf:
-                conflict = True
+                score -= 5
             seen[target] = is_wolf
             revealed = deaths.get(target) or players.get(target, {}).get("role")
             if revealed:
                 revealed_wolf = "wolf" in str(revealed).lower()
-                if revealed_wolf != is_wolf:
-                    conflict = True
-        if conflict:
+                score += 3 if revealed_wolf == is_wolf else -5
+        score += len(seen)
+        claimant_scores[claimant] = score
+        if score <= -3:
             conflicting_claimants.add(claimant)
-    for claimant, results in claimants.items():
-        if claimant not in conflicting_claimants and not any(
-            claimant != other and any(a != b for a, b in _shared_claim_results(results, claimants[other]))
-            for other in claimants
-        ):
-            trusted.add(claimant)
-    if my_role == "seer":
-        trusted = set()
-    elif len(trusted) != 1:
-        trusted = set()
+    if my_role != "seer":
+        eligible_claimants = [claimant for claimant in claimants
+                              if claimant not in conflicting_claimants
+                              and not (claimant in deaths and "wolf" in str(deaths[claimant]).lower())
+                              and claimant_scores[claimant] >= 0]
+        if eligible_claimants:
+            winner = min(eligible_claimants,
+                         key=lambda c: (-claimant_scores[c], claimant_first[c], c))
+            trusted.add(winner)
 
     known_wolf = set()
     known_clean = set()
@@ -163,10 +169,10 @@ def analyze(view):
     if my_role == "seer":
         known_wolf.update(my_wolf_results)
         known_clean.update(my_clean_results)
-        known_wolf.update(claimants)
-    for claimant in trusted:
-        for target, is_wolf in claimants.get(claimant, []):
-            (known_wolf if is_wolf else known_clean).add(target)
+    if my_role != "seer":
+        for claimant in trusted:
+            for target, is_wolf in claimants.get(claimant, []):
+                (known_wolf if is_wolf else known_clean).add(target)
 
     def score_for(seat, private=True):
         score = 0
@@ -186,8 +192,8 @@ def analyze(view):
                 score += 6
             if target == seat and voter in trusted:
                 score += 10
-        if seat in claimants:
-            score += 25 if seat in conflicting_claimants or seat not in trusted else 0
+        if seat in claimants and seat not in trusted:
+            score += 25
         if view.get("day", 0) >= 2 and not any(s["seat"] == seat for s in speeches):
             score += 4
         score += min(6, accusations.get(seat, 0) * 2)
@@ -202,9 +208,10 @@ def analyze(view):
     public_clean = {
         seat for seat, role in deaths.items() if "wolf" not in str(role).lower()
     }
-    for claimant in trusted:
-        for target, is_wolf in claimants.get(claimant, []):
-            (public_wolves if is_wolf else public_clean).add(target)
+    if my_role != "seer":
+        for claimant in trusted:
+            for target, is_wolf in claimants.get(claimant, []):
+                (public_wolves if is_wolf else public_clean).add(target)
     known_wolf = public_wolves
     private_clean = known_clean
     known_clean = public_clean
@@ -213,11 +220,13 @@ def analyze(view):
     known_clean = private_clean
     scores = {seat: score_for(seat, private=True) for seat in living}
     return {
-        "me": me, "my_role": my_role, "partner": partner, "players": players, "names": names,
+        "me": me, "my_role": my_role, "partner": partner, "day": view.get("day", 0),
+        "players": players, "names": names,
         "deaths": deaths, "speeches": speeches, "votes": votes, "today_votes": today_votes,
         "today_vote_counts": today_vote_counts,
         "exiles": exiles, "claimants": claimants, "trusted": trusted,
         "conflicting_claimants": conflicting_claimants, "accusations": accusations,
+        "claimant_scores": claimant_scores,
         "my_wolf_results": my_wolf_results, "my_clean_results": my_clean_results,
         "known_wolf": known_wolf, "known_clean": known_clean, "scores": scores,
         "public_score": public_scores,
@@ -227,6 +236,21 @@ def analyze(view):
 def _shared_claim_results(first, second):
     lookup = dict(second)
     return [(value, lookup[value]) for value, result in first if value in lookup and result != lookup[value]]
+
+
+def _seed_tie(view, seat):
+    seed = os.environ.get("MAKEFUN_TRIAL_SEED", "")
+    roster = ",".join(sorted(str(player.get("name", "")) for player in view.get("players", [])))
+    context = str(seed) + "|" + roster + "|" + str(view.get("day", 0)) + "|" + str(view.get("you", {}).get("seat")) + "|" + str(seat)
+    return hashlib.sha256(context.encode("utf-8")).hexdigest()
+
+
+def _seed_order(view, *parts):
+    seed = os.environ.get("MAKEFUN_TRIAL_SEED", "")
+    roster = ",".join(sorted(str(player.get("name", "")) for player in view.get("players", [])))
+    context = "|".join([str(seed), roster, str(view.get("day", 0)),
+                        str(view.get("you", {}).get("seat"))] + [str(part) for part in parts])
+    return hashlib.sha256(context.encode("utf-8")).hexdigest()
 
 
 def _options(options):
@@ -280,7 +304,7 @@ def decide_kill(view, analysis, options):
         if seat in top_public:
             score -= 20
         return score
-    return min(opts, key=lambda seat: (-rank(seat), seat))
+    return min(opts, key=lambda seat: (-rank(seat), _seed_tie(view, seat), seat))
 
 
 def decide_protect(view, analysis, options):
@@ -300,16 +324,17 @@ def decide_protect(view, analysis, options):
         score = 0
         if seat in analysis["trusted"]:
             score += 60
-        elif seat in analysis["claimants"]:
-            score += 40
-        if seat != analysis["me"]:
-            candidates = [s for s in opts if s != analysis["me"]]
-            if candidates and seat == min(candidates, key=lambda s: (analysis["scores"].get(s, 0), -speeches_by_seat.get(s, 0), s)):
-                score += 20
+        score += 20 * sum(1 for s in analysis["speeches"] if s["seat"] == seat and any(
+            re.search(r"\bseat\s+" + str(w) + r"\b", s["text"].lower()) for w, role in analysis["deaths"].items()
+            if "wolf" in str(role).lower()))
+        score += 12 * sum(1 for v in analysis["votes"] if v["seat"] == seat and v["target"] in analysis["deaths"]
+                          and "wolf" in str(analysis["deaths"][v["target"]]).lower())
+        if len(opts) > 1 and seat == max(opts, key=lambda s: (analysis["public_score"].get(s, 0), -s)):
+            score -= 100
         if prior_no_death:
             score += 10
         return score
-    return min(opts, key=lambda seat: (-rank(seat), seat))
+    return min(opts, key=lambda seat: (-rank(seat), _seed_tie(view, seat), seat))
 
 
 def decide_inspect(view, analysis, options):
@@ -333,21 +358,31 @@ def decide_vote(view, analysis, options):
             return direct[0]
         if not opts or all(seat in analysis["known_clean"] for seat in opts):
             return None
-        eligible = [seat for seat in opts if seat not in analysis["known_clean"]]
+        eligible = [seat for seat in opts if seat != analysis["me"] and seat not in analysis["known_clean"]]
         if not eligible:
-            eligible = opts
-        return min(eligible, key=lambda seat: (
-            -(analysis["scores"].get(seat, 0) + 6 * analysis["today_vote_counts"].get(seat, 0)),
-            seat,
-        ))
+            eligible = [seat for seat in opts if seat != analysis["me"]]
+        trusted_targets = [s for s in eligible if any(s == target and is_wolf
+            for claimant in analysis["trusted"] for target, is_wolf in analysis["claimants"].get(claimant, []))]
+        if trusted_targets:
+            return min(trusted_targets, key=lambda s: _seed_tie(view, s))
+        if role not in ("seer", "werewolf", "wolf"):
+            counts = {seat: analysis["today_vote_counts"].get(seat, 0) for seat in eligible}
+            high = max(counts.values(), default=0)
+            leaders = [seat for seat, count in counts.items() if count == high and count >= 2]
+            if leaders:
+                top_suspicion = max(analysis["scores"].get(seat, 0) for seat in eligible)
+                close_leaders = [seat for seat in leaders
+                                 if top_suspicion - analysis["scores"].get(seat, 0) <= 10]
+                if close_leaders:
+                    return min(close_leaders,
+                               key=lambda s: (-analysis["scores"].get(s, 0), _seed_tie(view, s), s))
+        return min(eligible, key=lambda seat: (-(analysis["scores"].get(seat, 0) + 2 * analysis["today_vote_counts"].get(seat, 0)), _seed_tie(view, seat), seat))
     partner = analysis["partner"]
     partner_votes = analysis["today_vote_counts"].get(partner, 0)
     my_votes = analysis["today_vote_counts"].get(analysis["me"], 0)
-    if partner in opts and partner_votes >= 3:
+    if partner in opts and partner_votes >= 3 and partner_votes == max(analysis["today_vote_counts"].get(s, 0) for s in opts):
         return partner
     eligible = [seat for seat in opts if seat not in (analysis["me"], partner)]
-    if my_votes >= 2 and eligible:
-        return min(eligible, key=lambda seat: (-analysis["public_score"].get(seat, 0), seat))
     opts = eligible
     for claimant, results in analysis["claimants"].items():
         if claimant in opts and any(target in (analysis["me"], partner) and is_wolf
@@ -355,7 +390,7 @@ def decide_vote(view, analysis, options):
             return claimant
     if not opts:
         return None
-    return min(opts, key=lambda seat: (-analysis["public_score"].get(seat, 0), seat))
+    return min(opts, key=lambda seat: (-analysis["public_score"].get(seat, 0), _seed_tie(view, seat), seat))
 
 
 def my_speeches(analysis):
@@ -363,8 +398,84 @@ def my_speeches(analysis):
 
 
 def has_announced(analysis, seat):
-    return any(re.search(r"\bseat\s+" + str(seat) + r"\b", text.lower())
-               for text in my_speeches(analysis))
+    return seat in _formal_seer_announcements(analysis)
+
+
+def _formal_seer_announcements(analysis):
+    found = set()
+    for text in my_speeches(analysis):
+        if re.search(r"\b(?:i am|i'm) the seer\b", text, re.I):
+            found.update(int(m.group(1)) for m in re.finditer(r"\bseat\s+(\d+)\s+is\s+(?:not\s+a\s+werewolf|a\s+werewolf|werewolf)\b", text, re.I))
+    return found
+
+
+def _evidence_reason(analysis, seat):
+    evidence = []
+    for vote in analysis["votes"]:
+        target = vote.get("target")
+        if vote.get("seat") == seat and target in analysis["deaths"] and "wolf" not in str(analysis["deaths"][target]).lower():
+            evidence.append((vote.get("day", 0), "Seat %s voted to exile seat %s on day %s, and seat %s was revealed a villager" % (seat, target, vote.get("day", 0), target)))
+    for speech in analysis["speeches"]:
+        if speech["seat"] == seat:
+            for target, role in analysis["deaths"].items():
+                if "wolf" in str(role).lower():
+                    continue
+                target_match = re.search(r"\bseat\s+" + str(target) + r"\b", speech["text"], re.I)
+                if not target_match:
+                    continue
+                context = speech["text"].lower()[max(0, target_match.start() - 70):target_match.end() + 70]
+                target_tail = speech["text"].lower()[target_match.end():target_match.end() + 55]
+                protective = re.match(r"\s*(?:(?:is|seems|looks)\s+)?(?:not\s+(?:a\s+)?(?:werewolf|wolf)|clean|innocent|a\s+villager|sounded\s+consistent)\b", target_tail)
+                accusatory = re.search(r"\b(?:werewolf|wolf|suspicious|lying|accuse[sd]?)\b", context)
+                if accusatory and not protective:
+                    evidence.append((speech["day"], "Seat %s accused seat %s, who was later revealed a villager" % (seat, target)))
+    if evidence:
+        return sorted(evidence, key=lambda item: (-item[0], item[1]))[0][1]
+    spoke = {s["day"] for s in analysis["speeches"] if s["seat"] == seat}
+    day = analysis.get("day", 0)
+    observed = set(range(max(1, day - 2), day))
+    if len(observed - spoke) >= 2:
+        return "Seat %s has said nothing in two days" % seat
+    return None
+
+
+def _fallback_statements(view, analysis):
+    me = analysis["me"]
+    day = view.get("day", 0)
+    speeches = analysis["speeches"]
+    counts = {}
+    for seat, data in analysis["players"].items():
+        if data["alive"] and seat != me:
+            counts[seat] = sum(1 for speech in speeches if speech["seat"] == seat)
+    unchecked = [seat for seat in counts if not analysis["players"][seat].get("role")
+                 and seat not in analysis["my_wolf_results"] and seat not in analysis["my_clean_results"]]
+    unchecked.sort(key=lambda seat: (counts[seat], _seed_order(view, "inspect", day, me, seat), seat))
+    living = list(counts)
+    living.sort(key=lambda seat: (_seed_order(view, "watch", day, me, seat), seat))
+    phrases = [
+        "I have no firm read yet; the group should inspect seat {a}.",
+        "No clear lead yet; seat {a} has been quiet, worth a check.",
+        "I am watching seats {a} and {b}; seat {a} has said little so far.",
+        "I do not have a strong read; perhaps we should check seat {a} next.",
+    ]
+    phrase_order = sorted(range(len(phrases)), key=lambda i: (_seed_order(view, "wording", day, me, len(phrases), i), i))
+    out = []
+    if unchecked and analysis["my_role"] != "seer":
+        pairs = [(seat, None) for seat in unchecked]
+        pairs += [(seat, living[(i + 1) % len(living)]) for i, seat in enumerate(unchecked) if len(living) > 1]
+        for pi in phrase_order:
+            for a, b in pairs:
+                if "{b}" in phrases[pi] and b is None:
+                    continue
+                out.append(phrases[pi].format(a=a, b=b))
+    elif len(living) >= 2:
+        for pi in phrase_order:
+            for i, a in enumerate(living):
+                b = living[(i + 1) % len(living)]
+                if a != b:
+                    out.append(phrases[pi].format(a=a, b=b))
+    out.append("I have no firm read yet.")
+    return out
 
 
 def _suspicion_statement(view, analysis):
@@ -374,28 +485,13 @@ def _suspicion_statement(view, analysis):
                   and seat != me and score >= 40]
     if candidates:
         seat = min(candidates, key=lambda s: (-analysis["scores"][s], s))
-        reason = "their statements accuse another player without clear support"
+        reason = _evidence_reason(analysis, seat)
         if seat in analysis["claimants"] and seat not in analysis["trusted"]:
             reason = "their seer claim conflicts with the evidence"
-        else:
-            for vote in analysis["votes"]:
-                if vote["seat"] == seat and vote["target"] in analysis["deaths"]:
-                    if "wolf" not in str(analysis["deaths"][vote["target"]]).lower():
-                        reason = "their vote helped exile a revealed villager"
-                        break
-        return "I suspect seat " + str(seat) + " because " + reason + "."
-    unchecked = sorted(
-        seat for seat, data in analysis["players"].items()
-        if data["alive"] and seat != me and not data["role"]
-        and seat not in analysis["my_wolf_results"] and seat not in analysis["my_clean_results"]
-    )
-    if unchecked:
-        return "I have no firm read yet; seer, please inspect seat " + str(unchecked[0]) + "."
-    living = sorted(seat for seat, data in analysis["players"].items() if data["alive"] and seat != me)
-    watched = living[:2]
-    if len(watched) >= 2:
-        return "I have no firm read yet; I am watching seats " + str(watched[0]) + " and " + str(watched[1]) + "."
-    return "I have no firm read yet."
+        if reason:
+            variants = [reason, reason + " according to the log", "the record shows that " + reason[0].lower() + reason[1:]]
+            return "I suspect seat " + str(seat) + " because " + variants[int(_seed_tie(view, seat), 16) % len(variants)] + "."
+    return _fallback_statements(view, analysis)[0]
 
 
 def _decide_speak(view, analysis):
@@ -431,18 +527,17 @@ def _decide_speak(view, analysis):
         todays_accusations += sum(1 for vote in analysis["today_votes"] if vote["target"] == me)
         pressure_reveal = todays_accusations >= 2
         has_results = bool(analysis["my_wolf_results"] or analysis["my_clean_results"])
-        reveal = (unannounced_wolf or
-                  (day >= 3 and has_results and not claimed) or
-                  pressure_reveal)
+        reveal = (day >= 2 and has_results) or unannounced_wolf or pressure_reveal
         if reveal:
             checks = []
-            all_checks = sorted(analysis["my_wolf_results"] | analysis["my_clean_results"])
+            living_wolves = sorted(s for s in analysis["my_wolf_results"] if analysis["players"].get(s, {}).get("alive"))
+            all_checks = living_wolves + sorted(analysis["my_wolf_results"] - set(living_wolves)) + sorted(analysis["my_clean_results"])
             for seat in all_checks:
                 checks.append("seat " + str(seat) + " is " +
                               ("a werewolf" if seat in analysis["my_wolf_results"] else "not a werewolf"))
             if not checks:
                 return fold("I am the seer.")
-            wolf_target = min(analysis["my_wolf_results"]) if analysis["my_wolf_results"] else None
+            wolf_target = living_wolves[0] if living_wolves else None
             request = " Please vote seat " + str(wolf_target) + "." if wolf_target is not None else ""
             return fold("I am the seer. " + "; ".join(checks) + "." + request)
         known_living_wolves = sorted(
@@ -450,8 +545,7 @@ def _decide_speak(view, analysis):
             if analysis["players"].get(seat, {}).get("alive") and seat != me
         )
         if known_living_wolves:
-            return fold("I suspect seat " + str(known_living_wolves[0]) +
-                        " because their voting pattern has been evasive.")
+            return fold("I am the seer. " + "; ".join("seat " + str(s) + " is " + ("a werewolf" if s in analysis["my_wolf_results"] else "not a werewolf") for s in sorted(analysis["my_wolf_results"] | analysis["my_clean_results"])) + ". Please vote seat " + str(known_living_wolves[0]) + ".")
 
     if role in ("werewolf", "wolf"):
         counterclaimant = next((
@@ -487,8 +581,9 @@ def _decide_speak(view, analysis):
         living = [seat for seat, data in analysis["players"].items() if data["alive"]]
         vote_target = decide_vote(view, analysis, [seat for seat in living if seat != me])
         if vote_target is not None and vote_target != analysis["partner"]:
-            return fold("I suspect seat " + str(vote_target) +
-                        " because their voting choices have been hard to trust.")
+            reason = _evidence_reason(analysis, vote_target)
+            if reason:
+                return fold("I suspect seat " + str(vote_target) + " because " + reason + ".")
 
     result = _suspicion_statement(view, analysis)
     round_number = max((speech["round"] for speech in day_own), default=0)
@@ -508,6 +603,13 @@ def decide_speak(view, analysis):
         return None
     if len(result) > STATEMENT_LIMIT:
         result = fold(result[:STATEMENT_LIMIT])
+    is_seer_reveal = analysis["my_role"] == "seer" and re.search(r"\b(?:i am|i'm) the seer\b", result, re.I)
+    if not is_seer_reveal and result in my_speeches(analysis):
+        alternatives = _fallback_statements(view, analysis) if analysis["my_role"] != "seer" else []
+        result = next((fold(candidate) for candidate in alternatives
+                       if fold(candidate) not in my_speeches(analysis)), None)
+        if result is None:
+            return None
     return result or None
 
 
